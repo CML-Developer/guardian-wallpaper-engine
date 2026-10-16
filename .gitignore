@@ -1,0 +1,8 @@
+*.bak
+*.log
+*.pid
+test_*.txt
+.DS_Store
+*~
+.vscode/
+.idea/

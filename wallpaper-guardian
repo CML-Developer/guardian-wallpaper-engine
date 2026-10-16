@@ -1,0 +1,665 @@
+#!/bin/bash
+# Wallpaper Guardian v2 - Protección activa contra wallpapers que crashean Plasma
+
+BLACKLIST_FILE="$HOME/.config/wallpaper-engine-safe/blacklist.txt"
+CONFIG_FILE="$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+CONFIG_DIR="$HOME/.config"
+CONFIG_FILENAME="plasma-org.kde.plasma.desktop-appletsrc"
+BACKUP_DIR="$HOME/.config/wallpaper-engine-safe/backups"
+LOG_FILE="$HOME/.config/wallpaper-engine-safe/guardian_log.txt"
+STEAM_WORKSHOP="$HOME/.local/share/Steam/steamapps/workshop/content/431960"
+PID_FILE="$HOME/.config/wallpaper-engine-safe/guardian.pid"
+REVERTING_FLAG="$HOME/.config/wallpaper-engine-safe/.reverting"
+# Evita que monitor_plasmashell blacklistee wallpapers seguros cuando
+# nosotros mismos matamos plasmashell para recargar
+INTENTIONAL_KILL_FLAG="$HOME/.config/wallpaper-engine-safe/.intentional_kill"
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+# ── Notificaciones ────────────────────────────────────────────────────────────
+
+notify_user() {
+    local title="$1" body="$2" urgency="${3:-normal}"
+    notify-send -u "$urgency" -a "Wallpaper Guardian" -t 8000 "$title" "$body" 2>/dev/null &
+}
+
+# ── Inicialización ────────────────────────────────────────────────────────────
+
+init() {
+    mkdir -p "$(dirname "$BLACKLIST_FILE")" "$BACKUP_DIR"
+    if [[ ! -f "$BLACKLIST_FILE" ]]; then
+        echo "2888802755" > "$BLACKLIST_FILE"
+        log "Blacklist inicializada con wallpaper problemático conocido"
+    fi
+    # Limpiar duplicados de la blacklist
+    sort -u "$BLACKLIST_FILE" -o "$BLACKLIST_FILE"
+}
+
+# ── Info del wallpaper ────────────────────────────────────────────────────────
+
+get_wallpaper_field() {
+    local wp_id="$1" field="$2"
+    local project="$STEAM_WORKSHOP/$wp_id/project.json"
+    [[ -f "$project" ]] && grep -oP "\"${field}\"\\s*:\\s*\"\\K[^\"]+" "$project" 2>/dev/null | head -1
+}
+
+# ── Backups ───────────────────────────────────────────────────────────────────
+
+backup_config() {
+    [[ -f "$CONFIG_FILE" ]] || return
+    # No respaldar archivos vacíos o truncados (ocurre durante escritura atómica)
+    local size
+    size=$(wc -c < "$CONFIG_FILE" 2>/dev/null)
+    [[ "${size:-0}" -lt 500 ]] && return
+    cp "$CONFIG_FILE" "$BACKUP_DIR/safe_config_$(date +%Y%m%d_%H%M%S).bak"
+    ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | tail -n +11 | xargs -r rm
+    log "Backup guardado"
+}
+
+revert_config() {
+    local latest
+    latest=$(ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | head -1)
+    if [[ ! -f "$latest" ]]; then
+        log "ERROR: No hay backups disponibles para revertir"
+        return 1
+    fi
+    # Marcar para ignorar el evento inotify que generará este write
+    touch "$REVERTING_FLAG"
+    cp "$latest" "$CONFIG_FILE"
+    log "Config revertida desde: $latest"
+    return 0
+}
+
+# ── Recarga de Plasma ────────────────────────────────────────────────────────
+
+reload_plasma_wallpaper() {
+    # Intentar recarga suave vía DBus (sin matar plasmashell)
+    if qdbus6 org.kde.plasmashell /PlasmaShell refreshCurrentShell 2>/dev/null; then
+        log "Plasma recargado vía DBus"
+        # Plasmashell no murió — limpiar flag para no ignorar crashes futuros reales
+        rm -f "$INTENTIONAL_KILL_FLAG"
+        return
+    fi
+    # Si el reload suave falla, reiniciar plasmashell fuera de nuestro cgroup.
+    log "Reiniciando plasmashell..."
+    killall plasmashell 2>/dev/null
+    sleep 1
+    # Lanzar en scope propio para que no quede en nuestro cgroup
+    systemd-run --user --scope --unit=plasmashell-restart \
+        /usr/bin/plasmashell --replace &>/dev/null 2>/dev/null || \
+        /usr/bin/plasmashell --replace &>/dev/null &
+}
+
+# ── Manejo de wallpaper problemático ─────────────────────────────────────────
+
+handle_bad_wallpaper() {
+    local wp_id="$1" reason="$2"
+    local title
+    title=$(get_wallpaper_field "$wp_id" "title")
+    title="${title:-ID $wp_id}"
+
+    log "BLOQUEADO [$reason]: $title ($wp_id)"
+
+    # Marcar como intencional INMEDIATAMENTE — si plasmashell crashea mientras
+    # revertimos (condición de carrera: crasheador ya cargando), monitor_plasmashell
+    # no debe blacklistear el wallpaper seguro del backup.
+    touch "$INTENTIONAL_KILL_FLAG"
+
+    # Agregar a blacklist si no está
+    if ! grep -qx "$wp_id" "$BLACKLIST_FILE" 2>/dev/null; then
+        echo "$wp_id" >> "$BLACKLIST_FILE"
+        log "Agregado a blacklist: $wp_id"
+    fi
+
+    if revert_config; then
+        # Si el backup revertido tiene WallpaperEngine, verificar si ese wallpaper
+        # específico también está en la blacklist. Si es seguro, dejarlo (es el
+        # wallpaper anterior del usuario). Solo forzar estático si también es crasheador.
+        if grep -q "wallpaperplugin=com.github.catsout.wallpaperEngineKde" "$CONFIG_FILE" 2>/dev/null; then
+            local backup_bad=false
+            while IFS= read -r bid; do
+                if grep -qx "$bid" "$BLACKLIST_FILE" 2>/dev/null; then
+                    backup_bad=true; break
+                fi
+            done < <(grep -oP 'WallpaperWorkShopId=\K[0-9]+' "$CONFIG_FILE" 2>/dev/null | sort -u)
+            if [[ "$backup_bad" == "true" ]]; then
+                log "Backup también usa WallpaperEngine crasheador — forzando wallpaper estático"
+                sed -i 's/wallpaperplugin=com.github.catsout.wallpaperEngineKde/wallpaperplugin=org.kde.image/g' \
+                    "$CONFIG_FILE"
+                sed -i '/WallpaperWorkShopId/d' "$CONFIG_FILE"
+            fi
+        fi
+        notify_user "🛡️ Wallpaper Bloqueado" \
+            "\"$title\"\n\nRazón: $reason\n\nConfiguración revertida al wallpaper anterior." \
+            "critical"
+        sleep 0.3
+        reload_plasma_wallpaper
+    else
+        notify_user "⚠️ Wallpaper Bloqueado (sin backup)" \
+            "\"$title\" bloqueado pero no hay backup para revertir.\nCambia el wallpaper manualmente." \
+            "critical"
+    fi
+}
+
+# ── Monitor del archivo de configuración ─────────────────────────────────────
+
+monitor_config() {
+    log "Monitor de config iniciado (eventos: close_write, moved_to)"
+
+    # Monitorear el DIRECTORIO por close_write y moved_to.
+    # - close_write: escritura directa (archivo cerrado después de write)
+    # - moved_to:    escritura atómica de KConfig (escribe tmp y hace rename)
+    # NO usamos 'modify': dispara mientras el archivo aún se está escribiendo
+    # (truncación → guardian leería archivo vacío y haría backup de nada)
+    inotifywait -m -q \
+        -e close_write -e moved_to \
+        --format '%e %f' \
+        "$CONFIG_DIR" 2>/dev/null | \
+    while read -r event filename; do
+
+        [[ "$filename" != "$CONFIG_FILENAME" ]] && continue
+
+        # Ignorar el evento que genera nuestro propio revert
+        if [[ -f "$REVERTING_FLAG" ]]; then
+            rm -f "$REVERTING_FLAG"
+            log "Evento ignorado (generado por revert propio)"
+            continue
+        fi
+
+        log "Cambio detectado en config (evento: $event)"
+
+        # Pequeña espera para asegurar que el write está completo
+        sleep 0.15
+
+        # Solo actuar si Wallpaper Engine KDE está activo como plugin
+        # (los IDs pueden quedar como residuos en el config aunque el plugin sea estático)
+        if ! grep -q "wallpaperplugin=com.github.catsout.wallpaperEngineKde" "$CONFIG_FILE" 2>/dev/null; then
+            log "Plugin estático activo — sin acción"
+            backup_config
+            continue
+        fi
+
+        # Leer IDs de wallpapers activos (puede haber más de un escritorio)
+        mapfile -t CURRENT_IDS < <(
+            grep -oP 'WallpaperWorkShopId=\K[0-9]+' "$CONFIG_FILE" 2>/dev/null | sort -u
+        )
+
+        if [[ ${#CURRENT_IDS[@]} -eq 0 ]]; then
+            log "Wallpaper Engine activo pero sin IDs — sin acción"
+            backup_config
+            continue
+        fi
+
+        blocked=false
+        for wp_id in "${CURRENT_IDS[@]}"; do
+
+            # 1. Verificar blacklist
+            if grep -qx "$wp_id" "$BLACKLIST_FILE" 2>/dev/null; then
+                handle_bad_wallpaper "$wp_id" "en lista negra (bloqueado previamente)"
+                blocked=true
+                break
+            fi
+
+            # 2. Advertir sobre wallpapers tipo scene (pueden ser inestables)
+            # No bloqueamos automáticamente — algunos scene funcionan bien.
+            # Si crashea, monitor_plasmashell lo agrega a la blacklist.
+            wp_type=$(get_wallpaper_field "$wp_id" "type")
+            if [[ "$wp_type" == "scene" ]]; then
+                local wp_title_scene
+                wp_title_scene=$(get_wallpaper_field "$wp_id" "title")
+                log "AVISO: Wallpaper scene aplicado: ${wp_title_scene:-$wp_id} — puede ser inestable"
+                notify_user "⚠️ Wallpaper Scene" \
+                    "\"${wp_title_scene:-$wp_id}\" es tipo 'scene'.\nPuede ser inestable en Linux/Wayland.\nSi crashea, será bloqueado automáticamente." \
+                    "normal"
+            fi
+
+        done
+
+        if [[ "$blocked" == "false" ]]; then
+            local wp_title
+            wp_title=$(get_wallpaper_field "${CURRENT_IDS[0]}" "title")
+            log "Wallpaper seguro aplicado: ${wp_title:-${CURRENT_IDS[0]}}"
+            backup_config
+            notify_user "✅ Wallpaper aplicado" "${wp_title:-ID: ${CURRENT_IDS[0]}}" "low"
+        fi
+    done
+
+    log "WARN: El loop de inotifywait terminó inesperadamente"
+}
+
+# ── Monitor de plasmashell (recuperación de crashes) ─────────────────────────
+
+monitor_plasmashell() {
+    log "Monitor de plasmashell iniciado"
+    local was_running=true
+
+    while true; do
+        sleep 5
+
+        if pgrep -x plasmashell > /dev/null 2>&1; then
+            was_running=true
+            continue
+        fi
+
+        # plasmashell no está corriendo
+        if [[ "$was_running" == "true" ]]; then
+            was_running=false
+
+            # Verificar si el kill fue intencional (nosotros lo matamos para recargar)
+            if [[ -f "$INTENTIONAL_KILL_FLAG" ]]; then
+                rm -f "$INTENTIONAL_KILL_FLAG"
+                log "Reinicio intencional de plasmashell — sin blacklist"
+                # Esperar a que vuelva, no hay nada más que hacer
+                sleep 8
+                continue
+            fi
+
+            # Crash inesperado: el wallpaper en el config ES el culpable
+            # Solo blacklistear si el config activo usa WallpaperEngine —
+            # si ya está en org.kde.image, el guardian ya había revertido antes
+            # y no hay nada nuevo que blacklistear.
+            log "CRASH inesperado detectado: plasmashell murió"
+
+            if grep -q "wallpaperplugin=com.github.catsout.wallpaperEngineKde" "$CONFIG_FILE" 2>/dev/null; then
+                mapfile -t BAD_IDS < <(
+                    grep -oP 'WallpaperWorkShopId=\K[0-9]+' "$CONFIG_FILE" 2>/dev/null | sort -u
+                )
+                for wp_id in "${BAD_IDS[@]}"; do
+                    if ! grep -qx "$wp_id" "$BLACKLIST_FILE" 2>/dev/null; then
+                        local title
+                        title=$(get_wallpaper_field "$wp_id" "title")
+                        echo "$wp_id" >> "$BLACKLIST_FILE"
+                        log "Auto-blacklist por crash: $wp_id (${title:-?})"
+                    fi
+                done
+            else
+                log "Config ya estático al momento del crash — sin blacklist adicional"
+            fi
+
+            # Revertir al backup seguro antes de reiniciar
+            local latest
+            latest=$(ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | head -1)
+            if [[ -f "$latest" ]]; then
+                touch "$REVERTING_FLAG"
+                cp "$latest" "$CONFIG_FILE"
+                # Si el backup también tiene WallpaperEngine, forzar estático
+                # para evitar loop de crashes
+                if grep -q "wallpaperplugin=com.github.catsout.wallpaperEngineKde" "$CONFIG_FILE" 2>/dev/null; then
+                    sed -i 's/wallpaperplugin=com.github.catsout.wallpaperEngineKde/wallpaperplugin=org.kde.image/g' "$CONFIG_FILE"
+                    sed -i '/WallpaperWorkShopId/d' "$CONFIG_FILE"
+                    log "Backup con WallpaperEngine — forzando estático para evitar loop"
+                fi
+                log "Config revertida antes de reiniciar plasmashell"
+            else
+                # Sin backup: forzar estático directamente
+                sed -i 's/wallpaperplugin=com.github.catsout.wallpaperEngineKde/wallpaperplugin=org.kde.image/g' "$CONFIG_FILE" 2>/dev/null
+                sed -i '/WallpaperWorkShopId/d' "$CONFIG_FILE" 2>/dev/null
+                log "Sin backup — forzando config estático"
+            fi
+        fi
+
+        # Reiniciar plasmashell
+        sleep 3
+        if ! pgrep -x plasmashell > /dev/null 2>&1; then
+            log "Reiniciando plasmashell..."
+            systemd-run --user --scope --unit=plasmashell-crash-recovery \
+                /usr/bin/plasmashell --replace &>/dev/null 2>/dev/null || \
+                /usr/bin/plasmashell --replace &>/dev/null &
+            sleep 8
+        fi
+    done
+}
+
+# ── Modo daemon ───────────────────────────────────────────────────────────────
+
+daemon_mode() {
+    echo $$ > "$PID_FILE"
+    init
+
+    echo "🛡️  Wallpaper Guardian v2 ACTIVO"
+    log "=== Guardian v2 iniciado (PID $$) ==="
+
+    monitor_plasmashell &
+    PLASMA_MONITOR_PID=$!
+
+    trap "kill $PLASMA_MONITOR_PID 2>/dev/null; rm -f '$PID_FILE' '$REVERTING_FLAG' '$INTENTIONAL_KILL_FLAG'; log '=== Guardian detenido ===' " EXIT INT TERM
+
+    monitor_config
+    # Si monitor_config termina (no debería), reiniciar
+    log "WARN: monitor_config terminó, reiniciando..."
+    exec "$0" daemon
+}
+
+# ── Test de todos los wallpapers ─────────────────────────────────────────────
+
+test_wallpapers() {
+    local WORKSHOP="$HOME/.local/share/Steam/steamapps/workshop/content/431960"
+
+    [[ -d "$WORKSHOP" ]] || { echo "❌ Steam Workshop no encontrado: $WORKSHOP"; return 1; }
+
+    mapfile -t ALL_IDS < <(ls "$WORKSHOP" 2>/dev/null | grep '^[0-9]')
+    [[ ${#ALL_IDS[@]} -eq 0 ]] && { echo "❌ No hay wallpapers instalados"; return 1; }
+
+    # Encontrar containments de escritorio
+    mapfile -t CONTAINMENTS < <(python3 -c "
+import re
+with open('$CONFIG_FILE') as f:
+    content = f.read()
+current = None
+for line in content.split('\n'):
+    m = re.match(r'^\[Containments\]\[(\d+)\]$', line)
+    if m: current = m.group(1)
+    elif 'plugin=org.kde.plasma.folder' in line and current:
+        print(current); current = None
+" 2>/dev/null)
+
+    [[ ${#CONTAINMENTS[@]} -eq 0 ]] && { echo "❌ No se encontraron containments de escritorio"; return 1; }
+
+    # Baseline estático en ubicación permanente
+    local TEST_BACKUP="$BACKUP_DIR/test_baseline.bak"
+    cp "$CONFIG_FILE" "$TEST_BACKUP"
+    sed -i 's/wallpaperplugin=com.github.catsout.wallpaperEngineKde/wallpaperplugin=org.kde.image/g' "$TEST_BACKUP"
+    sed -i '/WallpaperWorkShopId/d' "$TEST_BACKUP"
+
+    local REPORT_FILE="$HOME/.config/wallpaper-engine-safe/test_$(date +%Y%m%d_%H%M%S).txt"
+    local safe=() crashed=() skipped=()
+    local TEST_RUNNING=true
+    local SECS_PER_WP=22
+    local to_test=$(( ${#ALL_IDS[@]} - $(grep -c . "$BLACKLIST_FILE" 2>/dev/null || echo 0) ))
+
+    echo "════════════════════════════════════════════════════════"
+    echo "  🔬 Test REAL de $to_test wallpapers (reinicio por wallpaper)"
+    echo "  📋 Containments: ${CONTAINMENTS[*]}"
+    echo "  ⏱️  ~$(( to_test * SECS_PER_WP / 60 )) minutos estimados"
+    echo "  ℹ️  Verás el fondo cambiar en cada prueba"
+    echo "════════════════════════════════════════════════════════"
+    echo ""
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+
+    wp_info() {
+        python3 -c "
+import json
+try:
+    d=json.load(open('$WORKSHOP/$1/project.json'))
+    print(d.get('title','?')[:50], '['+d.get('type','?')+']')
+except: print('? [?]')
+" 2>/dev/null
+    }
+
+    apply_wp_config() {
+        local wp_id="$1"
+        # kwriteconfig6 es la herramienta oficial de KDE — escribe el config correctamente
+        for c in "${CONTAINMENTS[@]}"; do
+            kwriteconfig6 \
+                --file plasma-org.kde.plasma.desktop-appletsrc \
+                --group "Containments" --group "$c" \
+                --key "wallpaperplugin" "com.github.catsout.wallpaperEngineKde" 2>/dev/null
+            kwriteconfig6 \
+                --file plasma-org.kde.plasma.desktop-appletsrc \
+                --group "Containments" --group "$c" \
+                --group "Wallpaper" --group "com.github.catsout.wallpaperEngineKde" \
+                --group "General" \
+                --key "WallpaperWorkShopId" "$wp_id" 2>/dev/null
+        done
+    }
+
+    restore_static() {
+        cp "$TEST_BACKUP" "$CONFIG_FILE"
+    }
+
+    # PID del plasmashell que lanzamos — para detectar auto-reinicio por crash
+    PLASMA_PID=""
+
+    # Lanza plasmashell con el config activo y espera a que arranque
+    launch_plasma() {
+        pkill -9 -x plasmashell 2>/dev/null
+        sleep 1
+        nohup /usr/bin/plasmashell --replace &>/dev/null &
+        disown $! 2>/dev/null
+        # Esperar hasta 20s a que aparezca
+        local w=0
+        while ! pgrep -x plasmashell > /dev/null 2>&1 && (( w < 20 )); do
+            sleep 1; (( w++ ))
+        done
+        sleep 1  # stabilize
+        PLASMA_PID=$(pgrep -x plasmashell | head -1)
+    }
+
+    # Trap: solo ejecuta una vez
+    _test_cleanup() {
+        [[ "$TEST_RUNNING" == "false" ]] && return
+        TEST_RUNNING=false
+        echo ""
+        echo "⚠️  Interrumpido — restaurando..."
+        restore_static
+        pkill -9 -x plasmashell 2>/dev/null
+        sleep 1
+        nohup /usr/bin/plasmashell --replace &>/dev/null &
+        disown $! 2>/dev/null
+        systemctl --user start wallpaper-guardian.service 2>/dev/null
+        log "Test interrumpido"
+        trap - EXIT INT TERM
+    }
+    trap '_test_cleanup' EXIT INT TERM
+
+    systemctl --user stop wallpaper-guardian.service 2>/dev/null
+    log "Test real iniciado — guardian pausado"
+
+    # ── Loop principal ────────────────────────────────────────────────────
+
+    for wp_id in "${ALL_IDS[@]}"; do
+        local info
+        info=$(wp_info "$wp_id")
+
+        if grep -qx "$wp_id" "$BLACKLIST_FILE" 2>/dev/null; then
+            printf "⏭️  %-13s  %s\n" "$wp_id" "$info"
+            skipped+=("$wp_id")
+            continue
+        fi
+
+        printf "🔄 %-13s  %s ... " "$wp_id" "$info"
+
+        # 1. Escribir config con este wallpaper
+        apply_wp_config "$wp_id"
+
+        # 2. Reiniciar plasmashell con el config nuevo (esto carga el wallpaper de verdad)
+        launch_plasma
+
+        # 3. Si plasmashell no arrancó = crash durante carga
+        if ! pgrep -x plasmashell > /dev/null 2>&1; then
+            echo "💥 CRASH (no arrancó)"
+            grep -qx "$wp_id" "$BLACKLIST_FILE" || echo "$wp_id" >> "$BLACKLIST_FILE"
+            crashed+=("$wp_id")
+            log "Test CRASH (no arrancó): $wp_id"
+            restore_static
+            launch_plasma
+            continue
+        fi
+
+        # 4. Esperar para detectar crash tardío.
+        # Hay dos tipos de crash:
+        # a) plasmashell muere/cambia PID → KDE lo auto-reinicia (crashguard)
+        # b) pyext.py (renderer de WallpaperEngine) muere pero plasmashell sigue vivo
+        #    — SOLO relevante para wallpapers tipo 'scene'; video/web arrancan y terminan
+        #      pyext.py normalmente durante inicialización (no es crash)
+        local wp_type_for_test
+        wp_type_for_test=$(get_wallpaper_field "$wp_id" "type")
+
+        local initial_pyext_count=0
+        if [[ "$wp_type_for_test" == "scene" ]]; then
+            sleep 3  # esperar a que el scene renderer arranque pyext.py
+            initial_pyext_count=$(pgrep -P "$PLASMA_PID" -f "pyext.py" 2>/dev/null | wc -l)
+        fi
+
+        local crash=false
+        local start_pid="$PLASMA_PID"
+        for i in $(seq 1 20); do
+            sleep 1
+            local cur_pid
+            cur_pid=$(pgrep -x plasmashell | head -1)
+            if [[ -z "$cur_pid" ]]; then
+                crash=true; break
+            fi
+            if [[ -n "$start_pid" ]] && [[ "$cur_pid" != "$start_pid" ]]; then
+                # PID cambió = crasheó y KDE lo auto-reinició
+                crash=true; break
+            fi
+            # Solo para scene: verificar que pyext.py siga corriendo
+            if [[ "$initial_pyext_count" -gt 0 ]]; then
+                local cur_pyext
+                cur_pyext=$(pgrep -P "$cur_pid" -f "pyext.py" 2>/dev/null | wc -l)
+                if [[ "$cur_pyext" -lt "$initial_pyext_count" ]]; then
+                    crash=true; break
+                fi
+            fi
+        done
+
+        if [[ "$crash" == "true" ]]; then
+            echo "💥 CRASH"
+            grep -qx "$wp_id" "$BLACKLIST_FILE" || echo "$wp_id" >> "$BLACKLIST_FILE"
+            crashed+=("$wp_id")
+            log "Test CRASH: $wp_id"
+            restore_static
+            launch_plasma
+        else
+            echo "✅ OK"
+            safe+=("$wp_id")
+            log "Test OK: $wp_id"
+            # Restaurar a estático antes del siguiente test
+            restore_static
+            launch_plasma
+        fi
+    done
+
+    # ── Fin ───────────────────────────────────────────────────────────────
+
+    TEST_RUNNING=false
+    trap - EXIT INT TERM
+    restore_static
+    rm -f "$TEST_BACKUP"
+    launch_plasma
+    systemctl --user start wallpaper-guardian.service
+    log "Test completado — guardian reanudado"
+
+    {
+        echo "════════════════════════════════════════════════════════"
+        echo "  REPORTE TEST WALLPAPER ENGINE — $(date)"
+        echo "════════════════════════════════════════════════════════"
+        echo ""
+        echo "✅ SEGUROS (${#safe[@]}):"
+        for id in "${safe[@]}"; do
+            printf "  ✅ %-15s  %s\n" "$id" "$(wp_info "$id")"
+        done
+        echo ""
+        echo "💥 CRASHES — EN BLACKLIST (${#crashed[@]}):"
+        for id in "${crashed[@]}"; do
+            printf "  💥 %-15s  %s\n" "$id" "$(wp_info "$id")"
+        done
+        echo ""
+        echo "⏭️  SALTADOS — BLACKLIST PREVIA (${#skipped[@]}):"
+        for id in "${skipped[@]}"; do
+            printf "  ⏭️  %-15s  %s\n" "$id" "$(wp_info "$id")"
+        done
+        echo "════════════════════════════════════════════════════════"
+    } | tee "$REPORT_FILE"
+
+    echo ""
+    echo "Reporte: $REPORT_FILE"
+}
+
+# ── Comandos ──────────────────────────────────────────────────────────────────
+
+case "$1" in
+    daemon)
+        daemon_mode
+        ;;
+    check)
+        init
+        wp_id="$2"
+        if grep -qx "$wp_id" "$BLACKLIST_FILE" 2>/dev/null; then
+            echo "❌ BLOQUEADO: $wp_id está en lista negra"
+            exit 1
+        fi
+        wp_type=$(get_wallpaper_field "$wp_id" "type")
+        if [[ "$wp_type" == "scene" ]]; then
+            echo "⚠️  ADVERTENCIA: $wp_id es tipo 'scene' (inestable en Linux)"
+            exit 2
+        fi
+        echo "✅ Wallpaper $wp_id parece seguro (tipo: ${wp_type:-desconocido})"
+        ;;
+    add)
+        init
+        echo "$2" >> "$BLACKLIST_FILE"
+        sort -u "$BLACKLIST_FILE" -o "$BLACKLIST_FILE"
+        echo "✅ Wallpaper $2 agregado a lista negra"
+        log "Agregado manualmente a blacklist: $2"
+        ;;
+    remove)
+        sed -i "/^$2$/d" "$BLACKLIST_FILE"
+        echo "✅ Wallpaper $2 removido de lista negra"
+        log "Removido de blacklist: $2"
+        ;;
+    list)
+        echo "Wallpapers bloqueados:"
+        if [[ -f "$BLACKLIST_FILE" ]] && [[ -s "$BLACKLIST_FILE" ]]; then
+            while IFS= read -r wp_id; do
+                [[ -z "$wp_id" ]] && continue
+                title=$(get_wallpaper_field "$wp_id" "title")
+                wp_type=$(get_wallpaper_field "$wp_id" "type")
+                echo "  • $wp_id  ${title:+(${title})}  ${wp_type:+[${wp_type}]}"
+            done < "$BLACKLIST_FILE"
+        else
+            echo "  (ninguno)"
+        fi
+        ;;
+    log)
+        tail -80 "$LOG_FILE" 2>/dev/null || echo "No hay logs disponibles"
+        ;;
+    status)
+        if pgrep -f "wallpaper-guardian daemon" > /dev/null 2>&1; then
+            echo "🟢 Guardian activo"
+            pgrep -f "wallpaper-guardian daemon" | while read -r pid; do
+                echo "   PID: $pid"
+            done
+        else
+            echo "🔴 Guardian NO está corriendo"
+        fi
+        ;;
+    restore)
+        latest=$(ls -t "$BACKUP_DIR"/*.bak 2>/dev/null | head -1)
+        if [[ -f "$latest" ]]; then
+            cp "$latest" "$CONFIG_FILE"
+            echo "✅ Configuración restaurada desde $latest"
+            log "Restauración manual ejecutada"
+            killall plasmashell 2>/dev/null
+            sleep 1
+            /usr/bin/plasmashell --replace &>/dev/null &
+        else
+            echo "❌ No hay backups disponibles"
+        fi
+        ;;
+    test)
+        test_wallpapers
+        ;;
+    *)
+        cat << 'EOF'
+Wallpaper Guardian v2 - Sistema de protección activa
+
+USO:
+  wallpaper-guardian daemon          Iniciar en segundo plano (modo daemon)
+  wallpaper-guardian status          Ver si el guardian está activo
+  wallpaper-guardian check <id>      Verificar si un wallpaper es seguro
+  wallpaper-guardian add <id>        Agregar wallpaper a lista negra
+  wallpaper-guardian remove <id>     Remover de lista negra
+  wallpaper-guardian list            Ver wallpapers bloqueados
+  wallpaper-guardian restore         Restaurar última configuración segura
+  wallpaper-guardian log             Ver log de actividad
+  wallpaper-guardian test            Probar todos los wallpapers instalados
+EOF
+        ;;
+esac
