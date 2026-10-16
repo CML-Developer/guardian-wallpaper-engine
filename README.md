@@ -394,7 +394,7 @@ systemctl --user status wallpaper-guardian.service
 
 **GPL-3.0** — See `LICENSE` file for complete license text.
 
-**Copyright (C) 2024** Camilo Herrera Araya
+**Copyright (C) 2026** CML-Developer
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
