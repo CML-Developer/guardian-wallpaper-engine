@@ -56,8 +56,8 @@ cd guardian-wallpaper-engine
 ```
 
 Esto instalará:
-- `/home/camilo/.local/bin/wallpaper-guardian` → script principal
-- `/home/camilo/.config/systemd/user/wallpaper-guardian.service` → servicio systemd
+- `~/.local/bin/wallpaper-guardian` → script principal
+- `~/.config/systemd/user/wallpaper-guardian.service` → servicio systemd
 - Lista negra en: `~/.config/wallpaper-engine-safe/blacklist.txt`
 
 #### 3. Iniciar el servicio
